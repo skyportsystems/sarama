@@ -3,6 +3,7 @@ package sarama
 import (
 	"bytes"
 	"compress/gzip"
+	"fmt"
 	"io/ioutil"
 )
 
@@ -56,24 +57,27 @@ func (m *Message) encode(pe packetEncoder) error {
 		case CompressionGZIP:
 			var buf bytes.Buffer
 			writer := gzip.NewWriter(&buf)
-			writer.Write(m.Value)
-			writer.Close()
+			if _, err = writer.Write(m.Value); err != nil {
+				return err
+			}
+			if err = writer.Close(); err != nil {
+				return err
+			}
 			m.compressedCache = buf.Bytes()
 			payload = m.compressedCache
 		case CompressionSnappy:
-			tmp, err := SnappyEncode(m.Value)
+			tmp, err := snappyEncode(m.Value)
 			if err != nil {
 				return err
 			}
 			m.compressedCache = tmp
 			payload = m.compressedCache
 		default:
-			return EncodingError
+			return PacketEncodingError{fmt.Sprintf("Unsupported compression codec: %d", m.Codec)}
 		}
 	}
 
-	err = pe.putBytes(payload)
-	if err != nil {
+	if err = pe.putBytes(payload); err != nil {
 		return err
 	}
 
@@ -91,7 +95,7 @@ func (m *Message) decode(pd packetDecoder) (err error) {
 		return err
 	}
 	if format != messageFormat {
-		return DecodingError{Info: "Unexpected messageFormat"}
+		return PacketDecodingError{"Unexpected messageFormat"}
 	}
 
 	attribute, err := pd.getInt8()
@@ -115,7 +119,7 @@ func (m *Message) decode(pd packetDecoder) (err error) {
 		// nothing to do
 	case CompressionGZIP:
 		if m.Value == nil {
-			return DecodingError{Info: "GZIP compression specified, but no data to uncompress"}
+			return PacketDecodingError{"GZIP compression specified, but no data to uncompress"}
 		}
 		reader, err := gzip.NewReader(bytes.NewReader(m.Value))
 		if err != nil {
@@ -127,14 +131,14 @@ func (m *Message) decode(pd packetDecoder) (err error) {
 		return m.decodeSet()
 	case CompressionSnappy:
 		if m.Value == nil {
-			return DecodingError{Info: "Snappy compression specified, but no data to uncompress"}
+			return PacketDecodingError{"Snappy compression specified, but no data to uncompress"}
 		}
-		if m.Value, err = SnappyDecode(m.Value); err != nil {
+		if m.Value, err = snappyDecode(m.Value); err != nil {
 			return err
 		}
 		return m.decodeSet()
 	default:
-		return DecodingError{Info: "Invalid compression specified"}
+		return PacketDecodingError{fmt.Sprintf("Invalid compression specified: %d", m.Codec)}
 	}
 
 	err = pd.pop()

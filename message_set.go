@@ -25,24 +25,20 @@ func (msb *MessageBlock) encode(pe packetEncoder) error {
 }
 
 func (msb *MessageBlock) decode(pd packetDecoder) (err error) {
-	msb.Offset, err = pd.getInt64()
-	if err != nil {
+	if msb.Offset, err = pd.getInt64(); err != nil {
 		return err
 	}
 
-	pd.push(&lengthField{})
-	if err != nil {
+	if err = pd.push(&lengthField{}); err != nil {
 		return err
 	}
 
 	msb.Msg = new(Message)
-	err = msb.Msg.decode(pd)
-	if err != nil {
+	if err = msb.Msg.decode(pd); err != nil {
 		return err
 	}
 
-	err = pd.pop()
-	if err != nil {
+	if err = pd.pop(); err != nil {
 		return err
 	}
 
@@ -73,7 +69,7 @@ func (ms *MessageSet) decode(pd packetDecoder) (err error) {
 		switch err {
 		case nil:
 			ms.Messages = append(ms.Messages, msb)
-		case InsufficientData:
+		case ErrInsufficientData:
 			// As an optimization the server is allowed to return a partial message at the
 			// end of the message set. Clients should handle this case. So we just ignore such things.
 			ms.PartialTrailingMessage = true
