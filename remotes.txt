@@ -1,0 +1,4 @@
+origin	git@github.com:skyportsystems/sarama (fetch)
+origin	git@github.com:skyportsystems/sarama (push)
+upstream	https://github.com/Shopify/sarama.git (fetch)
+upstream	https://github.com/Shopify/sarama.git (push)
