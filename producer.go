@@ -38,24 +38,14 @@ type ProducerConfig struct {
 // want to use QueueMessage instead, and read the error back from the Errors()
 // channel. Note that when using QueueMessage, you *must* read the values from
 // the Errors() channel, or sarama will block indefinitely after a few requests.
-
-type bpmap struct {
-	m               sync.RWMutex
-	brokerProducers map[*Broker]*brokerProducer
-}
-
-type dlmap struct {
-	dm            sync.RWMutex
-	deliveryLocks map[topicPartition]chan bool
-}
-
 type Producer struct {
-	client *Client
-	config ProducerConfig
-	errors chan error
-
-	bps bpmap
-	dls dlmap
+	client          *Client
+	config          ProducerConfig
+	brokerProducers map[*Broker]*brokerProducer
+	m               sync.RWMutex
+	errors          chan error
+	deliveryLocks   map[topicPartition]chan bool
+	dm              sync.RWMutex
 }
 
 type brokerProducer struct {
@@ -91,15 +81,11 @@ func NewProducer(client *Client, config *ProducerConfig) (*Producer, error) {
 	}
 
 	return &Producer{
-		client: client,
-		config: *config,
-		errors: make(chan error, 16),
-		bps: bpmap{
-			brokerProducers: make(map[*Broker]*brokerProducer),
-		},
-		dls: dlmap{
-			deliveryLocks: make(map[topicPartition]chan bool),
-		},
+		client:          client,
+		config:          *config,
+		errors:          make(chan error, 16),
+		deliveryLocks:   make(map[topicPartition]chan bool),
+		brokerProducers: make(map[*Broker]*brokerProducer),
 	}, nil
 }
 
@@ -114,12 +100,9 @@ func (p *Producer) Errors() chan error {
 // it may otherwise leak memory. You must call this before calling Close on the
 // underlying client.
 func (p *Producer) Close() error {
-	p.bps.m.Lock() // we are a READER but we need to be immune to ADDITIONS; so write lock
-	defer p.bps.m.Unlock()
-	for _, bp := range p.bps.brokerProducers {
-		bp.Close() // does not take lock
+	for _, bp := range p.brokerProducers {
+		bp.Close()
 	}
-
 	return nil
 }
 
@@ -204,23 +187,22 @@ func (p *Producer) brokerProducerFor(tp topicPartition) (*brokerProducer, error)
 		return nil, err
 	}
 
-	p.bps.m.RLock()
-	bp, ok := p.bps.brokerProducers[broker]
-	p.bps.m.RUnlock()
+	p.m.RLock()
+	bp, ok := p.brokerProducers[broker]
+	p.m.RUnlock()
 	if !ok {
-		p.bps.m.Lock()
-		bp, ok = p.bps.brokerProducers[broker]
+		p.m.Lock()
+		bp, ok = p.brokerProducers[broker]
 		if !ok {
 			bp = p.newBrokerProducer(broker)
-			p.bps.brokerProducers[broker] = bp
+			p.brokerProducers[broker] = bp
 		}
-		p.bps.m.Unlock()
+		p.m.Unlock()
 	}
 
 	return bp, nil
 }
 
-// called with producers lock held
 func (p *Producer) newBrokerProducer(broker *Broker) *brokerProducer {
 	bp := &brokerProducer{
 		messages:    make(map[topicPartition][]*produceMessage),
@@ -254,11 +236,7 @@ func (p *Producer) newBrokerProducer(broker *Broker) *brokerProducer {
 			timer.Reset(p.config.MaxBufferTime)
 		}
 	shutdown:
-		// runs asynchronously, must take lock
-		p.bps.m.Lock()
-		delete(p.bps.brokerProducers, bp.broker)
-		p.bps.m.Unlock()
-
+		delete(p.brokerProducers, bp.broker)
 		bp.flushIfAnyMessages(p)
 		if shutdownRequired {
 			p.client.disconnectBroker(bp.broker)
@@ -438,17 +416,17 @@ func (bp *brokerProducer) Close() error {
 }
 
 func (p *Producer) tryAcquireDeliveryLock(tp topicPartition) bool {
-	p.dls.dm.RLock()
-	ch, ok := p.dls.deliveryLocks[tp]
-	p.dls.dm.RUnlock()
+	p.dm.RLock()
+	ch, ok := p.deliveryLocks[tp]
+	p.dm.RUnlock()
 	if !ok {
-		p.dls.dm.Lock()
-		ch, ok = p.dls.deliveryLocks[tp]
+		p.dm.Lock()
+		ch, ok = p.deliveryLocks[tp]
 		if !ok {
 			ch = make(chan bool, 1)
-			p.dls.deliveryLocks[tp] = ch
+			p.deliveryLocks[tp] = ch
 		}
-		p.dls.dm.Unlock()
+		p.dm.Unlock()
 	}
 
 	select {
@@ -460,10 +438,9 @@ func (p *Producer) tryAcquireDeliveryLock(tp topicPartition) bool {
 }
 
 func (p *Producer) releaseDeliveryLock(tp topicPartition) {
-	p.dls.dm.RLock()
-	ch := p.dls.deliveryLocks[tp]
-	p.dls.dm.RUnlock()
-
+	p.dm.RLock()
+	ch := p.deliveryLocks[tp]
+	p.dm.RUnlock()
 	select {
 	case <-ch:
 	default:
