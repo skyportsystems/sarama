@@ -7,15 +7,13 @@ type responseHeader struct {
 	correlationID int32
 }
 
-const maxMessageSize = 32 * 1024 * 1024 // 32MB
-
 func (r *responseHeader) decode(pd packetDecoder) (err error) {
 	r.length, err = pd.getInt32()
 	if err != nil {
 		return err
 	}
-	if r.length <= 4 || r.length > maxMessageSize {
-		return DecodingError{Info: fmt.Sprintf("Message too large or too small. Got %d", r.length)}
+	if r.length <= 4 || r.length > MaxResponseSize {
+		return PacketDecodingError{fmt.Sprintf("message of length %d too large or too small", r.length)}
 	}
 
 	r.correlationID, err = pd.getInt32()

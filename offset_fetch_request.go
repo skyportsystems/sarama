@@ -2,24 +2,54 @@ package sarama
 
 type OffsetFetchRequest struct {
 	ConsumerGroup string
+	Version       int16
 	partitions    map[string][]int32
 }
 
-func (r *OffsetFetchRequest) encode(pe packetEncoder) error {
-	err := pe.putString(r.ConsumerGroup)
-	if err != nil {
+func (r *OffsetFetchRequest) encode(pe packetEncoder) (err error) {
+	if r.Version < 0 || r.Version > 1 {
+		return PacketEncodingError{"invalid or unsupported OffsetFetchRequest version field"}
+	}
+
+	if err = pe.putString(r.ConsumerGroup); err != nil {
 		return err
 	}
-	err = pe.putArrayLength(len(r.partitions))
-	if err != nil {
+	if err = pe.putArrayLength(len(r.partitions)); err != nil {
 		return err
 	}
 	for topic, partitions := range r.partitions {
-		err = pe.putString(topic)
+		if err = pe.putString(topic); err != nil {
+			return err
+		}
+		if err = pe.putInt32Array(partitions); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *OffsetFetchRequest) decode(pd packetDecoder) (err error) {
+	if r.ConsumerGroup, err = pd.getString(); err != nil {
+		return err
+	}
+	partitionCount, err := pd.getArrayLength()
+	if err != nil {
+		return err
+	}
+	if partitionCount == 0 {
+		return nil
+	}
+	r.partitions = make(map[string][]int32)
+	for i := 0; i < partitionCount; i++ {
+		topic, err := pd.getString()
 		if err != nil {
 			return err
 		}
-		pe.putInt32Array(partitions)
+		partitions, err := pd.getInt32Array()
+		if err != nil {
+			return err
+		}
+		r.partitions[topic] = partitions
 	}
 	return nil
 }
@@ -29,7 +59,7 @@ func (r *OffsetFetchRequest) key() int16 {
 }
 
 func (r *OffsetFetchRequest) version() int16 {
-	return 0
+	return r.Version
 }
 
 func (r *OffsetFetchRequest) AddPartition(topic string, partitionID int32) {

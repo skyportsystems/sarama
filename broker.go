@@ -1,58 +1,27 @@
 package sarama
 
 import (
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
-
-// BrokerConfig is used to pass multiple configuration options to Broker.Open.
-type BrokerConfig struct {
-	MaxOpenRequests int           // How many outstanding requests the broker is allowed to have before blocking attempts to send.
-	ReadTimeout     time.Duration // How long to wait for a response before timing out and returning an error.
-	WriteTimeout    time.Duration // How long to wait for a transmit to succeed before timing out and returning an error.
-}
-
-// NewBrokerConfig returns a new broker configuration with sane defaults.
-func NewBrokerConfig() *BrokerConfig {
-	return &BrokerConfig{
-		MaxOpenRequests: 4,
-		ReadTimeout:     1 * time.Minute,
-		WriteTimeout:    1 * time.Minute,
-	}
-}
-
-// Validate checks a BrokerConfig instance. This will return a
-// ConfigurationError if the specified values don't make sense.
-func (config *BrokerConfig) Validate() error {
-	if config.MaxOpenRequests < 0 {
-		return ConfigurationError("Invalid MaxOpenRequests")
-	}
-
-	if config.ReadTimeout <= 0 {
-		return ConfigurationError("Invalid ReadTimeout")
-	}
-
-	if config.WriteTimeout <= 0 {
-		return ConfigurationError("Invalid WriteTimeout")
-	}
-
-	return nil
-}
 
 // Broker represents a single Kafka broker connection. All operations on this object are entirely concurrency-safe.
 type Broker struct {
 	id   int32
 	addr string
 
-	conf          *BrokerConfig
+	conf          *Config
 	correlationID int32
 	conn          net.Conn
 	connErr       error
 	lock          sync.Mutex
+	opened        int32
 
 	responses chan responsePromise
 	done      chan bool
@@ -70,14 +39,18 @@ func NewBroker(addr string) *Broker {
 	return &Broker{id: -1, addr: addr}
 }
 
-// Open tries to connect to the Broker. It takes the broker lock synchronously, then spawns a goroutine which
-// connects and releases the lock. This means any subsequent operations on the broker will block waiting for
-// the connection to finish. To get the effect of a fully synchronous Open call, follow it by a call to Connected().
-// The only errors Open will return directly are ConfigurationError or AlreadyConnected. If conf is nil, the result of
-// NewBrokerConfig() is used.
-func (b *Broker) Open(conf *BrokerConfig) error {
+// Open tries to connect to the Broker if it is not already connected or connecting, but does not block
+// waiting for the connection to complete. This means that any subsequent operations on the broker will
+// block waiting for the connection to succeed or fail. To get the effect of a fully synchronous Open call,
+// follow it by a call to Connected(). The only errors Open will return directly are ConfigurationError or
+// AlreadyConnected. If conf is nil, the result of NewConfig() is used.
+func (b *Broker) Open(conf *Config) error {
+	if !atomic.CompareAndSwapInt32(&b.opened, 0, 1) {
+		return ErrAlreadyConnected
+	}
+
 	if conf == nil {
-		conf = NewBrokerConfig()
+		conf = NewConfig()
 	}
 
 	err := conf.Validate()
@@ -87,28 +60,36 @@ func (b *Broker) Open(conf *BrokerConfig) error {
 
 	b.lock.Lock()
 
-	if b.conn != nil {
-		b.lock.Unlock()
-		Logger.Printf("Failed to connect to broker %s\n", b.addr)
-		Logger.Println(AlreadyConnected)
-		return AlreadyConnected
-	}
-
 	go withRecover(func() {
 		defer b.lock.Unlock()
 
-		b.conn, b.connErr = net.Dial("tcp", b.addr)
+		dialer := net.Dialer{
+			Timeout:   conf.Net.DialTimeout,
+			KeepAlive: conf.Net.KeepAlive,
+		}
+
+		if conf.Net.TLS.Enable {
+			b.conn, b.connErr = tls.DialWithDialer(&dialer, "tcp", b.addr, conf.Net.TLS.Config)
+		} else {
+			b.conn, b.connErr = dialer.Dial("tcp", b.addr)
+		}
 		if b.connErr != nil {
-			Logger.Printf("Failed to connect to broker %s\n", b.addr)
-			Logger.Println(b.connErr)
+			Logger.Printf("Failed to connect to broker %s: %s\n", b.addr, b.connErr)
+			b.conn = nil
+			atomic.StoreInt32(&b.opened, 0)
 			return
 		}
+		b.conn = newBufConn(b.conn)
 
 		b.conf = conf
 		b.done = make(chan bool)
-		b.responses = make(chan responsePromise, b.conf.MaxOpenRequests)
+		b.responses = make(chan responsePromise, b.conf.Net.MaxOpenRequests-1)
 
-		Logger.Printf("Connected to broker %s\n", b.addr)
+		if b.id >= 0 {
+			Logger.Printf("Connected to broker at %s (registered as #%d)\n", b.addr, b.id)
+		} else {
+			Logger.Printf("Connected to broker at %s (unregistered)\n", b.addr)
+		}
 		go withRecover(b.responseReceiver)
 	})
 
@@ -124,33 +105,33 @@ func (b *Broker) Connected() (bool, error) {
 	return b.conn != nil, b.connErr
 }
 
-func (b *Broker) Close() (err error) {
+func (b *Broker) Close() error {
 	b.lock.Lock()
 	defer b.lock.Unlock()
-	defer func() {
-		if err == nil {
-			Logger.Printf("Closed connection to broker %s\n", b.addr)
-		} else {
-			Logger.Printf("Failed to close connection to broker %s.\n", b.addr)
-			Logger.Println(err)
-		}
-	}()
 
 	if b.conn == nil {
-		return NotConnected
+		return ErrNotConnected
 	}
 
 	close(b.responses)
 	<-b.done
 
-	err = b.conn.Close()
+	err := b.conn.Close()
 
 	b.conn = nil
 	b.connErr = nil
 	b.done = nil
 	b.responses = nil
 
-	return
+	if err == nil {
+		Logger.Printf("Closed connection to broker %s\n", b.addr)
+	} else {
+		Logger.Printf("Error while closing connection to broker %s: %s\n", b.addr, err)
+	}
+
+	atomic.StoreInt32(&b.opened, 0)
+
+	return err
 }
 
 // ID returns the broker ID retrieved from Kafka's metadata, or -1 if that is not known.
@@ -163,10 +144,10 @@ func (b *Broker) Addr() string {
 	return b.addr
 }
 
-func (b *Broker) GetMetadata(clientID string, request *MetadataRequest) (*MetadataResponse, error) {
+func (b *Broker) GetMetadata(request *MetadataRequest) (*MetadataResponse, error) {
 	response := new(MetadataResponse)
 
-	err := b.sendAndReceive(clientID, request, response)
+	err := b.sendAndReceive(request, response)
 
 	if err != nil {
 		return nil, err
@@ -175,10 +156,10 @@ func (b *Broker) GetMetadata(clientID string, request *MetadataRequest) (*Metada
 	return response, nil
 }
 
-func (b *Broker) GetConsumerMetadata(clientID string, request *ConsumerMetadataRequest) (*ConsumerMetadataResponse, error) {
+func (b *Broker) GetConsumerMetadata(request *ConsumerMetadataRequest) (*ConsumerMetadataResponse, error) {
 	response := new(ConsumerMetadataResponse)
 
-	err := b.sendAndReceive(clientID, request, response)
+	err := b.sendAndReceive(request, response)
 
 	if err != nil {
 		return nil, err
@@ -187,10 +168,10 @@ func (b *Broker) GetConsumerMetadata(clientID string, request *ConsumerMetadataR
 	return response, nil
 }
 
-func (b *Broker) GetAvailableOffsets(clientID string, request *OffsetRequest) (*OffsetResponse, error) {
+func (b *Broker) GetAvailableOffsets(request *OffsetRequest) (*OffsetResponse, error) {
 	response := new(OffsetResponse)
 
-	err := b.sendAndReceive(clientID, request, response)
+	err := b.sendAndReceive(request, response)
 
 	if err != nil {
 		return nil, err
@@ -199,15 +180,15 @@ func (b *Broker) GetAvailableOffsets(clientID string, request *OffsetRequest) (*
 	return response, nil
 }
 
-func (b *Broker) Produce(clientID string, request *ProduceRequest) (*ProduceResponse, error) {
+func (b *Broker) Produce(request *ProduceRequest) (*ProduceResponse, error) {
 	var response *ProduceResponse
 	var err error
 
 	if request.RequiredAcks == NoResponse {
-		err = b.sendAndReceive(clientID, request, nil)
+		err = b.sendAndReceive(request, nil)
 	} else {
 		response = new(ProduceResponse)
-		err = b.sendAndReceive(clientID, request, response)
+		err = b.sendAndReceive(request, response)
 	}
 
 	if err != nil {
@@ -217,10 +198,10 @@ func (b *Broker) Produce(clientID string, request *ProduceRequest) (*ProduceResp
 	return response, nil
 }
 
-func (b *Broker) Fetch(clientID string, request *FetchRequest) (*FetchResponse, error) {
+func (b *Broker) Fetch(request *FetchRequest) (*FetchResponse, error) {
 	response := new(FetchResponse)
 
-	err := b.sendAndReceive(clientID, request, response)
+	err := b.sendAndReceive(request, response)
 
 	if err != nil {
 		return nil, err
@@ -229,10 +210,10 @@ func (b *Broker) Fetch(clientID string, request *FetchRequest) (*FetchResponse, 
 	return response, nil
 }
 
-func (b *Broker) CommitOffset(clientID string, request *OffsetCommitRequest) (*OffsetCommitResponse, error) {
+func (b *Broker) CommitOffset(request *OffsetCommitRequest) (*OffsetCommitResponse, error) {
 	response := new(OffsetCommitResponse)
 
-	err := b.sendAndReceive(clientID, request, response)
+	err := b.sendAndReceive(request, response)
 
 	if err != nil {
 		return nil, err
@@ -241,10 +222,10 @@ func (b *Broker) CommitOffset(clientID string, request *OffsetCommitRequest) (*O
 	return response, nil
 }
 
-func (b *Broker) FetchOffset(clientID string, request *OffsetFetchRequest) (*OffsetFetchResponse, error) {
+func (b *Broker) FetchOffset(request *OffsetFetchRequest) (*OffsetFetchResponse, error) {
 	response := new(OffsetFetchResponse)
 
-	err := b.sendAndReceive(clientID, request, response)
+	err := b.sendAndReceive(request, response)
 
 	if err != nil {
 		return nil, err
@@ -253,7 +234,73 @@ func (b *Broker) FetchOffset(clientID string, request *OffsetFetchRequest) (*Off
 	return response, nil
 }
 
-func (b *Broker) send(clientID string, req requestEncoder, promiseResponse bool) (*responsePromise, error) {
+func (b *Broker) JoinGroup(request *JoinGroupRequest) (*JoinGroupResponse, error) {
+	response := new(JoinGroupResponse)
+
+	err := b.sendAndReceive(request, response)
+	if err != nil {
+		return nil, err
+	}
+
+	return response, nil
+}
+
+func (b *Broker) SyncGroup(request *SyncGroupRequest) (*SyncGroupResponse, error) {
+	response := new(SyncGroupResponse)
+
+	err := b.sendAndReceive(request, response)
+	if err != nil {
+		return nil, err
+	}
+
+	return response, nil
+}
+
+func (b *Broker) LeaveGroup(request *LeaveGroupRequest) (*LeaveGroupResponse, error) {
+	response := new(LeaveGroupResponse)
+
+	err := b.sendAndReceive(request, response)
+	if err != nil {
+		return nil, err
+	}
+
+	return response, nil
+}
+
+func (b *Broker) Heartbeat(request *HeartbeatRequest) (*HeartbeatResponse, error) {
+	response := new(HeartbeatResponse)
+
+	err := b.sendAndReceive(request, response)
+	if err != nil {
+		return nil, err
+	}
+
+	return response, nil
+}
+
+func (b *Broker) ListGroups(request *ListGroupsRequest) (*ListGroupsResponse, error) {
+	response := new(ListGroupsResponse)
+
+	err := b.sendAndReceive(request, response)
+	if err != nil {
+		return nil, err
+	}
+
+	return response, nil
+}
+
+func (b *Broker) DescribeGroups(request *DescribeGroupsRequest) (*DescribeGroupsResponse, error) {
+	response := new(DescribeGroupsResponse)
+
+	err := b.sendAndReceive(request, response)
+	if err != nil {
+		return nil, err
+	}
+
+	return response, nil
+}
+
+func (b *Broker) send(rb requestBody, promiseResponse bool) (*responsePromise, error) {
 	b.lock.Lock()
 	defer b.lock.Unlock()
 
@@ -261,16 +308,16 @@ func (b *Broker) send(clientID string, req requestEncoder, promiseResponse bool)
 		if b.connErr != nil {
 			return nil, b.connErr
 		}
-		return nil, NotConnected
+		return nil, ErrNotConnected
 	}
 
-	fullRequest := request{b.correlationID, clientID, req}
-	buf, err := encode(&fullRequest)
+	req := &request{correlationID: b.correlationID, clientID: b.conf.ClientID, body: rb}
+	buf, err := encode(req)
 	if err != nil {
 		return nil, err
 	}
 
-	err = b.conn.SetWriteDeadline(time.Now().Add(b.conf.WriteTimeout))
+	err = b.conn.SetWriteDeadline(time.Now().Add(b.conf.Net.WriteTimeout))
 	if err != nil {
 		return nil, err
 	}
@@ -285,14 +332,14 @@ func (b *Broker) send(clientID string, req requestEncoder, promiseResponse bool)
 		return nil, nil
 	}
 
-	promise := responsePromise{fullRequest.correlationID, make(chan []byte), make(chan error)}
+	promise := responsePromise{req.correlationID, make(chan []byte), make(chan error)}
 	b.responses <- promise
 
 	return &promise, nil
 }
 
-func (b *Broker) sendAndReceive(clientID string, req requestEncoder, res decoder) error {
-	promise, err := b.send(clientID, req, res != nil)
+func (b *Broker) sendAndReceive(req requestBody, res decoder) error {
+	promise, err := b.send(req, res != nil)
 
 	if err != nil {
 		return err
@@ -326,7 +373,10 @@ func (b *Broker) decode(pd packetDecoder) (err error) {
 		return err
 	}
 
-	b.addr = fmt.Sprint(host, ":", port)
+	b.addr = net.JoinHostPort(host, fmt.Sprint(port))
+	if _, _, err := net.SplitHostPort(b.addr); err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -355,16 +405,24 @@ func (b *Broker) encode(pe packetEncoder) (err error) {
 }
 
 func (b *Broker) responseReceiver() {
+	var dead error
 	header := make([]byte, 8)
 	for response := range b.responses {
-		err := b.conn.SetReadDeadline(time.Now().Add(b.conf.ReadTimeout))
+		if dead != nil {
+			response.errors <- dead
+			continue
+		}
+
+		err := b.conn.SetReadDeadline(time.Now().Add(b.conf.Net.ReadTimeout))
 		if err != nil {
+			dead = err
 			response.errors <- err
 			continue
 		}
 
 		_, err = io.ReadFull(b.conn, header)
 		if err != nil {
+			dead = err
 			response.errors <- err
 			continue
 		}
@@ -372,23 +430,22 @@ func (b *Broker) responseReceiver() {
 		decodedHeader := responseHeader{}
 		err = decode(header, &decodedHeader)
 		if err != nil {
+			dead = err
 			response.errors <- err
 			continue
 		}
 		if decodedHeader.correlationID != response.correlationID {
 			// TODO if decoded ID < cur ID, discard until we catch up
 			// TODO if decoded ID > cur ID, save it so when cur ID catches up we have a response
-			response.errors <- DecodingError{Info: "CorrelationID didn't match"}
+			dead = PacketDecodingError{fmt.Sprintf("correlation ID didn't match, wanted %d, got %d", response.correlationID, decodedHeader.correlationID)}
+			response.errors <- dead
 			continue
 		}
 
 		buf := make([]byte, decodedHeader.length-4)
 		_, err = io.ReadFull(b.conn, buf)
 		if err != nil {
-			// XXX: the above ReadFull call inherits the same ReadDeadline set at the top of this loop, so it may
-			// fail with a timeout error. If this happens, our connection is permanently toast since we will no longer
-			// be aligned correctly on the stream (we'll be reading garbage Kafka headers from the middle of data).
-			// Can we/should we fail harder in that case?
+			dead = err
 			response.errors <- err
 			continue
 		}
